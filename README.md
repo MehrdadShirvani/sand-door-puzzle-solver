@@ -148,6 +148,10 @@ transfers are exact integer arithmetic.
 | `H`    | half-full cell (0.5)   |
 | `F`    | full cell (1.0)        |
 
+In CLI output a `=` line between two rows marks a **joined** pair: the gate
+between the cell above and the cell below is held open (see the joining rule
+in the problem statement), and the sand in the two cells drains as one body.
+
 ### Search algorithms
 
 | Algorithm   | Class                          | Optimal in openings? | Notes                                                                       |
@@ -156,8 +160,8 @@ transfers are exact integer arithmetic.
 | **BFS**     | Breadth-first search           | Yes (fewest openings)| The baseline "fewest door openings" solver.                                  |
 | **IDS**     | Iterative deepening DFS        | Yes (fewest openings)| Depth-limited DFS with the current path only on the visited set.             |
 | **UCS**     | Uniform-cost search (Dijkstra) | Yes (fewest cost)    | Uses the weighted gate/side-door costs, so it minimizes cost, not openings.  |
-| **A* (sand)** | A* with the total-sand heuristic  | Yes (fewest cost) | f = g + h where h is the total remaining sand. Admissible but weak.         |
-| **A* (column)** | A* with the per-column heuristic | Yes (fewest cost) | f = g + h where h combines the structural lower bounds below. Much stronger |
+| **A* (sand)** | A* with the sand-bearing-columns heuristic | Yes (fewest cost) | f = g + h where h counts sand-bearing columns. Admissible but weak.         |
+| **A* (column)** | A* with the structural heuristic | Yes (fewest cost) | f = g + h combining sand-bearing columns with non-bottom sand cells. Stronger |
 | **Greedy**  | Fixed deterministic strategy   | No                   | Scans the grid top-to-bottom, left-to-right; each sand-bearing cell gets its bottom gate opened. Passes repeat until the grid is empty. |
 
 Cost model (as in the statement):
@@ -175,48 +179,57 @@ so both A* variants are guaranteed to return a cost-optimal plan, exactly like
 UCS — they just expand far fewer nodes because the search is steered toward
 the goal. Side doors are deliberately *relaxed away* in both: they cost 1 but
 remove no sand and cannot move sand out of the grid, so ignoring them keeps
-the bounds safe.
+the bounds safe. Joins (see the joining rule) are accounted for honestly: a
+join is created by one gate opening, and a joined body drains through the exit
+gate of the bottom-row cell it sits in, which is still an opening in that
+column — so both heuristics stay admissible and consistent in the presence of
+joins.
 
-#### Heuristic 1 — total remaining sand (used by `A* (sand)`)
-
-```
-h(s) = S            # S = total sand in the grid, in half-units
-```
-
-*Rationale:* sand leaves the grid only through bottom-row gates, and each exit
-opening flushes at most 2 half-units at a cost of `1 + 2·(b + b')` (with `b'`
-the sand left in the cell after flushing). With `S` half-units still to remove,
-any plan therefore pays at least `ceil(S/2)` exit openings plus at least `2S`
-from the flushing surcharges — comfortably more than `S`. So one cost unit per
-remaining half-unit of sand is a safe lower bound. It is cheap to compute and
-monotone, but it ignores *where* the sand sits, so it is weak: every cell that
-gains sand mid-plan raises `h` back up even though that transfer was necessary.
-
-#### Heuristic 3 — per-column structural bound (used by `A* (column)`)
+#### Heuristic 1 — sand-bearing columns (used by `A* (sand)`)
 
 ```
-h(s) = N_above + ceil(S / 2) + 2·S
+h(s) = C_sand      # number of columns that contain at least one sand cell
 ```
 
-where `S` is again the total sand in half-units and `N_above` is the number of
-non-empty cells **not in the bottom row**. It sums three independent,
-non-overlapping lower bounds:
+*Rationale:* a side door moves exactly one half-unit out of a FULL cell and
+leaves it half-full, and a half-full cell cannot use a side door at all.
+Therefore at least one half-unit of sand always remains in a column that ever
+contained sand, and that remainder can only leave downwards, through the
+column's own bottom-row gate. Every gate opening costs at least 1, so each
+sand-bearing column contributes at least 1 to the total cost. It is cheap to
+compute and monotone, but it ignores how much sand sits in each column, so it
+is weak on boards with many filled cells.
 
-1. **`N_above`** — every non-bottom cell holding sand must have its bottom
-   gate opened at least once to pass its sand downward, and each opening costs
-   at least 1.
-2. **`ceil(S/2)`** — all `S` half-units must leave through bottom-row gates,
-   each of which flushes at most 2 half-units, so at least `ceil(S/2)` exit
-   openings are required.
-3. **`2S`** — an exit opening flushing `t` half-units from a cell that held
-   `b` costs `1 + 2(b + b')` with `b' = b − t`, i.e. `1 + 4b − 2t ≥ 1 + 2t`.
-   Summed over all the sand that must exit, that is at least 2 per half-unit.
+#### Heuristic 3 — structural bound (used by `A* (column)`)
 
-Because the three terms count disjoint aspects of any plan (interior gate
-openings, exit-opening count, exit-opening surcharges), adding them cannot
-overestimate. This dominates heuristic 1 and is much stronger on tall or
-tightly-packed boards, since it also rewards the search for emptying the
-*upper* rows, not just for reducing the total sand.
+```
+h(s) = N_above + C_sand
+```
+
+where `C_sand` is the number of sand-bearing columns (heuristic 1) and
+`N_above` is the number of non-empty cells **not in the bottom row**. It sums
+two independent, non-overlapping lower bounds:
+
+1. **`N_above`** — every non-bottom cell holding sand must have its own bottom
+   gate opened at least once. Its sand leaves either by a direct downward
+   transfer or through a join with the cell below (the join is itself created
+   by opening that same gate). Side doors cannot replace this: they move one
+   half-unit out of a FULL cell and leave it half-full, so some sand always
+   remains and must eventually pass through the cell's own bottom gate.
+2. **`C_sand`** — each sand-bearing column needs at least one exit opening in
+   its bottom row (see heuristic 1).
+
+The two terms count disjoint openings (gates of non-bottom cells vs. exit
+gates in the bottom row), so their sum cannot overestimate. This dominates
+heuristic 1 and is much stronger on tall or tightly-packed boards, since it
+rewards the search for emptying the *upper* rows, not just for reducing the
+sand.
+
+> **Why the heuristics changed when joins were introduced:** the earlier
+> formulation assumed each exit opening flushes at most 2 half-units. With
+> joined bodies that is false — a joined stack can drain entirely through one
+> exit opening — so the old bound could overestimate. The formulas above are
+> safe under joins as well as plain transfers.
 
 ### Random initial state
 
@@ -281,15 +294,18 @@ button, and on the CLI via `--special-case`:
 results:
 
 ```
-DFS    : 24 openings, cost  64
-BFS    : 10 openings, cost  50
-IDS    : 10 openings, cost  50
-UCS    : 10 openings, cost  50
-A* (sand)   : 10 openings, cost  50
-A* (column) : 10 openings, cost  50
-Greedy : 10 openings, cost  50
+DFS         : 24 openings, cost  64
+BFS         :  7 openings, cost  47
+IDS         :  7 openings, cost  47
+UCS         : 10 openings, cost  34
+A* (sand)   : 10 openings, cost  34
+A* (column) : 10 openings, cost  34
+Greedy      :  8 openings, cost  48
 ```
 
-BFS, IDS, UCS and Greedy all reach the 10-opening optimum on this board, while
-DFS wanders into a much longer plan — a nice illustration of why uninformed
-depth-first search is not optimal.
+With the joining rule in force, UCS and both A\* variants find the true
+cost-34 optimum on this board (a joined body drains through a single exit
+gate, which plain BFS/IDS cannot exploit since they only count openings).
+BFS/IDS still minimize the number of door openings (7), while the cost-aware
+searches exploit joins to cut the weighted cost — a good illustration of the
+difference between the two objectives. DFS still produces a much longer plan.

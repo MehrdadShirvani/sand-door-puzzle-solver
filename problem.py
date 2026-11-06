@@ -14,6 +14,14 @@ Action = Tuple[int, int, str]
 # (next_state, action, cost)
 Successor = Tuple[State, Action, int]
 
+# A "world" is a grid plus the set of bottom gates that are currently held open
+# (i.e. joined cells).  Join (r, c) connects cell (r, c) with the cell below it.
+# Plain State values are accepted anywhere a world is expected and mean "no
+# joins" - the helpers below normalize both forms.
+World = Tuple[State, frozenset]
+Join = Tuple[int, int]
+EMPTY_JOINS: frozenset = frozenset()
+
 HALF = 1  # half-full, stored in half-units (0.5 sand)
 FULL = 2  # full of sand (1.0 sand)
 
@@ -33,7 +41,51 @@ def from_half_units(state: State) -> List[List[float]]:
     return [[cell / 2 for cell in row] for row in state]
 
 
-def print_grid(grid: Sequence[Sequence[int]], label: str = "") -> None:
+def unpack(world) -> Tuple[State, frozenset]:
+    """Split a state-or-world into (grid, open joins)."""
+    if len(world) == 2 and isinstance(world[1], frozenset):
+        return world[0], world[1]
+    return world, EMPTY_JOINS
+
+
+def pack(grid: Sequence[Sequence[int]], joins: frozenset) -> World:
+    return (tuple(tuple(row) for row in grid), joins)
+
+
+def join_is_valid(grid: State, row: int, col: int) -> bool:
+    """A joined pair stays joined only while the rule holds:
+
+    both cells contain sand, the lower cell is full, and the upper cell is
+    full or half-full (case 1: full over half/full, case 2: half over full).
+    """
+    return grid[row][col] > 0 and grid[row + 1][col] == FULL
+
+
+def prune_joins(grid: State, joins: frozenset) -> frozenset:
+    """Drop every join that no longer satisfies the staying-open rule."""
+    rows = len(grid)
+    return frozenset(j for j in joins if j[0] + 1 < rows and join_is_valid(grid, j[0], j[1]))
+
+
+def connected_body(joins: frozenset, seed: Join) -> set:
+    """All cells connected to `seed` through open (joined) bottom gates."""
+    body = {seed}
+    frontier = [seed]
+    while frontier:
+        r, c = frontier.pop()
+        for gate in ((r - 1, c), (r, c)):
+            if gate in joins:
+                for cell in (gate, (gate[0] + 1, gate[1])):
+                    if cell not in body:
+                        body.add(cell)
+                        frontier.append(cell)
+    return body
+
+
+def print_grid(grid, label: str = "", joins: Optional[frozenset] = None) -> None:
+    grid, embedded_joins = unpack(grid)
+    if joins is None:
+        joins = embedded_joins
     symbols = {
         0: ".",
         1: "H",
@@ -41,8 +93,12 @@ def print_grid(grid: Sequence[Sequence[int]], label: str = "") -> None:
     }
     if label:
         print(label)
-    for row in grid:
+    for r, row in enumerate(grid):
         print(" ".join(symbols.get(cell, "?") for cell in row))
+        if r + 1 < len(grid):
+            print(" ".join("=" if (r, c) in joins else " " for c in range(len(row))))
+    if joins:
+        print("(= marks joined cells: the gate between them is held open)")
     print()
 
 
@@ -95,63 +151,94 @@ def special_case_state() -> State:
     return load_state_from_digits(["1 0", "0 1", "0 1", "1 0"])
 
 
-def is_empty_state(state: State) -> bool:
-    return all(cell == 0 for row in state for cell in row)
+def is_empty_state(state) -> bool:
+    grid, _ = unpack(state)
+    return all(cell == 0 for row in grid for cell in row)
 
 
-def iter_actions(state: State) -> Iterable[Action]:
-    rows = len(state)
-    cols = len(state[0]) if rows else 0
+def iter_actions(state) -> Iterable[Action]:
+    grid, _ = unpack(state)
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 0
 
     for r in range(rows):
         for c in range(cols):
-            if state[r][c] > 0:
+            if grid[r][c] > 0:
                 if r + 1 <= rows:
                     yield (r, c, "down")
-                if c > 0 and state[r][c] >= FULL:
+                if c > 0 and grid[r][c] >= FULL:
                     yield (r, c, "left")
-                if c + 1 < cols and state[r][c] >= FULL:
+                if c + 1 < cols and grid[r][c] >= FULL:
                     yield (r, c, "right")
 
 
-def apply_action(state: State, row: int, col: int, direction: str) -> State:
-    """Apply one door-opening action to a state and return the resulting state."""
-    rows = len(state)
-    cols = len(state[0]) if rows else 0
-    next_state = [list(r) for r in state]
+def apply_action(state, row: int, col: int, direction: str):
+    """Apply one door-opening action and return the resulting world.
 
-    current = next_state[row][col]
+    Bottom gates obey the joining rule: when opening the gate between an upper
+    cell and the cell below it, if after the transfer both cells still contain
+    sand and the lower cell is full (case 1: full over half/full - half over
+    full; case 2: half over full), the gate stays open and the sand in the two
+    cells connects.  A connected body of sand drains together when the bottom
+    gate of any of its cells is opened.
+    """
+    grid, joins = unpack(state)
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 0
+    next_grid = [list(r) for r in grid]
+
+    current = next_grid[row][col]
     if current <= 0:
         return state
 
     if direction == "down":
         if row + 1 < rows:
-            below = next_state[row + 1][col]
-            transfer = min(current, 2 - below)
-            if transfer > 0:
-                next_state[row][col] -= transfer
-                next_state[row + 1][col] += transfer
-        else:
-            next_state[row][col] = 0
-        return tuple(tuple(r) for r in next_state)
+            # The sand of the whole connected body pours through this gate.
+            body = connected_body(joins, (row, col))
+            body = {cell for cell in body if next_grid[cell[0]][cell[1]] > 0}
+            body_total = sum(next_grid[r][c] for r, c in body)
+            below = next_grid[row + 1][col]
+            transfer = min(body_total, 2 - below)
+            remaining = transfer
+            # Sand drains from the opened cell and everything connected ABOVE
+            # it, funnelling down through the opened gate (gravity).
+            for body_row, body_col in sorted(body):
+                if body_row > row:
+                    continue
+                if remaining <= 0:
+                    break
+                take = min(next_grid[body_row][body_col], remaining)
+                next_grid[body_row][body_col] -= take
+                remaining -= take
+            next_grid[row + 1][col] += transfer
+            new_joins = prune_joins(tuple(tuple(r) for r in next_grid), joins)
+            # The gate itself stays open in case 1 / case 2.
+            if next_grid[row][col] > 0 and next_grid[row + 1][col] == FULL:
+                new_joins = new_joins | {(row, col)}
+            return pack(next_grid, new_joins)
+        # Bottom row: the whole connected body drains out of the grid.
+        body = connected_body(joins, (row, col))
+        for body_row, body_col in body:
+            next_grid[body_row][body_col] = 0
+        return pack(next_grid, prune_joins(tuple(tuple(r) for r in next_grid), joins))
 
     if direction == "left":
         if col <= 0:
             return state
-        target = next_state[row][col - 1]
+        target = next_grid[row][col - 1]
         if current >= FULL and target < FULL:
-            next_state[row][col] -= 1
-            next_state[row][col - 1] += 1
-        return tuple(tuple(r) for r in next_state)
+            next_grid[row][col] -= 1
+            next_grid[row][col - 1] += 1
+        return pack(next_grid, prune_joins(tuple(tuple(r) for r in next_grid), joins))
 
     if direction == "right":
         if col + 1 >= cols:
             return state
-        target = next_state[row][col + 1]
+        target = next_grid[row][col + 1]
         if current >= FULL and target < FULL:
-            next_state[row][col] -= 1
-            next_state[row][col + 1] += 1
-        return tuple(tuple(r) for r in next_state)
+            next_grid[row][col] -= 1
+            next_grid[row][col + 1] += 1
+        return pack(next_grid, prune_joins(tuple(tuple(r) for r in next_grid), joins))
 
     raise ValueError(f"Unknown direction: {direction!r}")
 
@@ -171,10 +258,11 @@ def side_cost() -> int:
     return 1
 
 
-def action_cost(state: State, action: Action) -> int:
+def action_cost(state, action: Action) -> int:
+    grid, _ = unpack(state)
     row, col, direction = action
     if direction == "down":
-        return gate_cost(state[row][col], apply_action(state, row, col, "down")[row][col])
+        return gate_cost(grid[row][col], apply_action(state, row, col, "down")[0][row][col])
     return side_cost()
 
 
@@ -182,9 +270,8 @@ def successors(state: State) -> List[Successor]:
     """All (next_state, action, cost) pairs reachable in one door opening."""
     result: List[Successor] = []
     for action in iter_actions(state):
-        row, col, direction = action
-        next_state = apply_action(state, row, col, direction)
-        if next_state == state:
+        next_state = apply_action(state, *action)
+        if unpack(next_state)[0] == unpack(state)[0] and unpack(next_state)[1] == unpack(state)[1]:
             continue
         result.append((next_state, action, action_cost(state, action)))
     return result
@@ -327,59 +414,66 @@ def solve_ucs(initial_state: State) -> List[Action]:
 # ---------------------------------------------------------------------------
 
 
-def total_sand(state: State) -> int:
+def total_sand(state) -> int:
     """Total sand in the grid, measured in half-units."""
-    return sum(sum(row) for row in state)
+    grid, _ = unpack(state)
+    return sum(sum(row) for row in grid)
 
 
-def heuristic_sand(state: State) -> int:
-    """Heuristic 1 - total remaining sand (weak).
+def heuristic_sand(state) -> int:
+    """Heuristic 1 - sand-bearing columns (weak, join-aware).
 
-    h(s) = S where S is the total sand in half-units.
+    h(s) = number of columns that contain at least one sand cell.
 
-    Rationale: sand leaves the grid only through bottom-row gates, each such
-    opening moves at most 2 half-units out and costs 1 + 2*(b + b') >= 1 + 2t
-    where t is the amount actually flushed.  With S half-units to remove the
-    total cost is at least ceil(S/2) + 2S >= S, so counting one unit of cost
-    per remaining half-unit of sand never overestimates.
+    Rationale: a side door moves exactly one half-unit out of a FULL cell,
+    leaving it half-full, and a half-full cell cannot use a side door at all.
+    Therefore at least one half-unit of sand always remains in a column that
+    ever contained sand, and that remainder can only leave downwards, through
+    the column's own bottom-row gate.  Every gate opening costs at least 1,
+    so each sand-bearing column contributes at least 1 to the total cost.
+    Joins do not break this: a joined body drains through the gate of the
+    bottom-row cell it sits in, which is still an opening in that column.
     """
-    return total_sand(state)
+    grid, _ = unpack(state)
+    cols = len(grid[0]) if grid else 0
+    return sum(1 for c in range(cols) if any(row[c] > 0 for row in grid))
 
 
-def heuristic_column(state: State) -> int:
-    """Heuristic 3 - per-column structural bound (strong).
+def heuristic_column(state) -> int:
+    """Heuristic 3 - structural bound (strong, join-aware).
 
-    h(s) = N_above + ceil(S / 2) + 2 * S
+    h(s) = N_above + C_sand
 
-    where S is the total sand in half-units and N_above the number of
-    non-empty cells that are NOT in the bottom row.
+    where N_above is the number of non-empty cells that are NOT in the bottom
+    row and C_sand is the number of columns containing sand (the same bound as
+    heuristic 1).
 
-    Rationale (three independent, non-overlapping lower bounds):
+    Rationale (two independent, non-overlapping lower bounds):
 
-    1. Every non-bottom cell holding sand must have its bottom gate opened at
-       least once to pass its sand downwards, and each opening costs at least
-       1  ->  contributes N_above.
+    1. N_above - every non-bottom cell holding sand must have its own bottom
+       gate opened at least once.  Its sand can leave either by a direct
+       downward transfer or through a join with the cell below (the join is
+       itself created by opening that same gate).  Side doors cannot replace
+       this: they move exactly one half-unit out of a FULL cell and leave it
+       half-full, and a half-full cell cannot export anything, so some sand
+       always remains and must eventually pass through the cell's own bottom
+       gate.  Each opening costs at least 1.
 
-    2. All S half-units of sand must leave through bottom-row gates.  Each
-       exit opening flushes at most 2 half-units, so at least ceil(S/2) exit
-       openings are needed, each costing at least 1
-       ->  contributes ceil(S / 2).
+    2. C_sand - see heuristic 1: each sand-bearing column needs at least one
+       exit opening in its bottom row, at a cost of at least 1.
 
-    3. A bottom-gate opening that flushes t half-units out of the grid costs
-       1 + 2*(b + b') with b' = b - t, i.e. 1 + 4b - 2t >= 1 + 2t (since
-       t <= b).  Summed over all sand: at least 2 per half-unit
-       ->  contributes 2 * S.
-
-    Side doors are deliberately ignored (relaxed away), which keeps the bound
-    safe: they cost 1 without removing any sand, and they cannot move sand out
-    of the grid, so none of the three terms can be avoided by moving sand
-    sideways.  The heuristic is consistent: no single action lowers it by more
-    than that action's cost.
+    The two terms count disjoint openings (gates of non-bottom cells vs. exit
+    gates in the bottom row), so their sum cannot overestimate.  Joins are
+    handled honestly: creating a join still costs one opening of the upper
+    cell's gate, and draining a joined body still costs one opening of the
+    exit gate.  The heuristic is consistent: no single action lowers it by
+    more than that action's cost.
     """
-    rows = len(state)
-    sand = total_sand(state)
-    above = sum(1 for r in range(rows - 1) for cell in state[r] if cell > 0)
-    return above + -(-sand // 2) + 2 * sand
+    grid, _ = unpack(state)
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 0
+    above = sum(1 for r in range(rows - 1) for cell in grid[r] if cell > 0)
+    return above + sum(1 for c in range(cols) if any(row[c] > 0 for row in grid))
 
 
 HEURISTICS = {
@@ -439,10 +533,11 @@ def solve_greedy(initial_state: State) -> List[Action]:
     actions: List[Action] = []
 
     while not is_empty_state(state):
+        grid, _ = unpack(state)
         progress = False
         for r in range(rows):
             for c in range(cols):
-                if state[r][c] > 0:
+                if grid[r][c] > 0:
                     action = (r, c, "down")
                     next_state = apply_action(state, r, c, "down")
                     if next_state != state:
@@ -493,7 +588,7 @@ def path_cost(initial_state: State, actions: Sequence[Action]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def show_action_sequence(start_state: State, actions: Sequence[Action], delay: float = 0.7) -> None:
+def show_action_sequence(start_state, actions: Sequence[Action], delay: float = 0.7) -> None:
     """Print a simple animation of the board as each action is applied."""
     current = start_state
     print("Initial state")
@@ -598,14 +693,21 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
 
         def draw_board(self) -> None:
             self.canvas.delete("all")
-            rows_count = len(self.state)
-            cols_count = len(self.state[0]) if rows_count else 0
-            for r, row in enumerate(self.state):
+            grid, joins = unpack(self.state)
+            rows_count = len(grid)
+            cols_count = len(grid[0]) if rows_count else 0
+            for r, row in enumerate(grid):
                 for c, value in enumerate(row):
                     x1 = c * cell_size + 5
                     y1 = r * cell_size + 5
                     x2 = x1 + cell_size - 10
                     y2 = y1 + cell_size - 10
+                    if (r, c) in joins:
+                        # Joined with the cell below: merge the two boxes into
+                        # one connected shape by drawing an open boundary.
+                        y2 += 5
+                    if (r - 1, c) in joins:
+                        y1 -= 5
                     self.canvas.create_rectangle(
                         x1, y1, x2, y2, fill=colors[value], outline="#334155", width=2
                     )
@@ -616,6 +718,10 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
                         fill="#1e293b",
                         font=("Segoe UI", 11, "bold"),
                     )
+                    if (r, c) in joins:
+                        self.canvas.create_line(
+                            x1, y2, x2, y2, fill="#0ea5e9", width=4
+                        )
             self.canvas.configure(
                 scrollregion=(0, 0, max(1, cols_count * cell_size), max(1, rows_count * cell_size))
             )
@@ -625,11 +731,12 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
                 return
             x = self.canvas.canvasx(event.x)
             y = self.canvas.canvasy(event.y)
+            grid, _ = unpack(self.state)
             col = int(x // cell_size)
             row = int(y // cell_size)
-            if row >= len(self.state) or col >= len(self.state[0]):
+            if row >= len(grid) or col >= len(grid[0]):
                 return
-            board = [list(line) for line in self.state]
+            board = [list(line) for line in grid]
             board[row][col] = (board[row][col] + 1) % 3
             self.state = tuple(tuple(line) for line in board)
             self.clear_solution()
