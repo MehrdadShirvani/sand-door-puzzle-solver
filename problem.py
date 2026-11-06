@@ -624,6 +624,13 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.step_index = 0
             self.playing = False
             self.solving = False
+            # Animation state: the world we animate FROM, the gate opened by
+            # the current step, and the tween progress t in [0, 1].
+            self.anim_from = None
+            self.anim_gate: Optional[Action] = None
+            self.anim_t = 1.0
+            self.animating = False
+            self.step_delay_ms = 650
 
             controls = ttk.Frame(root, padding=10)
             controls.pack(fill="x")
@@ -678,6 +685,12 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.play_button.pack(side="left", padx=5)
             self.next_button = ttk.Button(navigation, text="Next", command=self.next)
             self.next_button.pack(side="left", padx=5)
+            ttk.Label(navigation, text="Speed").pack(side="left", padx=(16, 4))
+            self.speed_var = tk.IntVar(value=3)
+            ttk.Scale(
+                navigation, from_=1, to=6, variable=self.speed_var,
+                command=lambda _v: self.apply_speed(), length=120,
+            ).pack(side="left", padx=2)
             self.status_var = tk.StringVar(value="Click cells to cycle between empty, half-full, and full.")
             ttk.Label(navigation, textvariable=self.status_var).pack(side="left", padx=12)
 
@@ -691,37 +704,162 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.step_index = 0
             self.update_status()
 
-        def draw_board(self) -> None:
+        def draw_board(self, gate_flash: Optional[Action] = None, t: float = 1.0) -> None:
+            """Draw the board.
+
+            Cells are drawn as sand tanks whose fill height matches the sand
+            level.  Vertically joined cells are merged into ONE tank: the sand
+            of the whole connected run pools at its bottom instead of each
+            cell filling separately.  `gate_flash` marks the gate opened by
+            the current step; `t` in [0, 1] interpolates between the previous
+            state (t = 0) and the current one (t = 1) so sand levels slide
+            smoothly instead of jumping.
+            """
             self.canvas.delete("all")
             grid, joins = unpack(self.state)
+            prev_grid = prev_joins = None
+            if self.anim_from is not None:
+                prev_grid, prev_joins = unpack(self.anim_from)
+
             rows_count = len(grid)
             cols_count = len(grid[0]) if rows_count else 0
-            for r, row in enumerate(grid):
-                for c, value in enumerate(row):
-                    x1 = c * cell_size + 5
-                    y1 = r * cell_size + 5
-                    x2 = x1 + cell_size - 10
-                    y2 = y1 + cell_size - 10
-                    if (r, c) in joins:
-                        # Joined with the cell below: merge the two boxes into
-                        # one connected shape by drawing an open boundary.
-                        y2 += 5
-                    if (r - 1, c) in joins:
-                        y1 -= 5
-                    self.canvas.create_rectangle(
-                        x1, y1, x2, y2, fill=colors[value], outline="#334155", width=2
-                    )
-                    self.canvas.create_text(
-                        (x1 + x2) / 2,
-                        (y1 + y2) / 2,
-                        text=labels[value],
-                        fill="#1e293b",
-                        font=("Segoe UI", 11, "bold"),
-                    )
-                    if (r, c) in joins:
-                        self.canvas.create_line(
-                            x1, y2, x2, y2, fill="#0ea5e9", width=4
+            margin = 6
+            gate_w = 12  # width of a gate opening in a cell's bottom edge
+
+            def interp(rr, cc):
+                """Interpolated sand level (half-units) of cell (rr, cc)."""
+                cur = grid[rr][cc]
+                if prev_grid is None:
+                    return float(cur)
+                return prev_grid[rr][cc] + (cur - prev_grid[rr][cc]) * t
+
+            def open_below(rr, cc):
+                """Is the gate between (rr, cc) and the cell below open,
+                considering current and (during a tween) previous joins?"""
+                if (rr, cc) in joins:
+                    return True
+                return prev_joins is not None and t < 0.5 and (rr, cc) in prev_joins
+
+            # Group each column into vertical runs of joined cells; every run
+            # is drawn as ONE tank whose sand pools at its bottom.
+            for c in range(cols_count):
+                r = 0
+                while r < rows_count:
+                    run_top = r
+                    while r + 1 < rows_count and open_below(r, c):
+                        r += 1
+                    run_bottom = r
+                    r += 1
+
+                    cx1 = c * cell_size + margin
+                    cy1 = run_top * cell_size + margin
+                    cx2 = cx1 + cell_size - 2 * margin
+                    cy2 = run_bottom * cell_size + cell_size - margin
+
+                    # Total sand in the run (interpolated, half-units); the
+                    # fill fraction is measured against the run's capacity.
+                    sand = sum(interp(rr, c) for rr in range(run_top, run_bottom + 1))
+                    capacity = 2 * (run_bottom - run_top + 1)
+                    fill_frac = min(1.0, sand / capacity)
+
+                    inner_top = cy1 + 2
+                    inner_bot = cy2 - 2
+                    fill_h = (inner_bot - inner_top) * fill_frac
+                    if fill_h > 0.5:
+                        sand_color = "#b45309" if sand >= capacity - 0.25 else "#eab308"
+                        self.canvas.create_rectangle(
+                            cx1 + 2, inner_bot - fill_h, cx2 - 2, inner_bot,
+                            fill=sand_color, outline="",
                         )
+
+                    # Tank outline: one box around the whole run.  Internal
+                    # joins get a sky-blue gate connector; the run's bottom
+                    # edge opens (gap) when its gate is the one flashing.
+                    bottom_flash = (
+                        gate_flash is not None and gate_flash[2] == "down"
+                        and gate_flash[0] == run_bottom and gate_flash[1] == c
+                    )
+                    parts = [
+                        (cx1, cy1, cx2, cy1),   # top
+                        (cx1, cy1, cx1, cy2),   # left
+                        (cx2, cy1, cx2, cy2),   # right
+                    ]
+                    mid1 = (cx1 + cx2) / 2 - gate_w / 2
+                    mid2 = (cx1 + cx2) / 2 + gate_w / 2
+                    if bottom_flash:
+                        parts.append((cx1, cy2, mid1, cy2))
+                        parts.append((mid2, cy2, cx2, cy2))
+                    else:
+                        parts.append((cx1, cy2, cx2, cy2))
+                    for (px1, py1, px2, py2) in parts:
+                        hot = bottom_flash and py1 == cy2
+                        self.canvas.create_line(
+                            px1, py1, px2, py2,
+                            fill="#0ea5e9" if hot else "#334155",
+                            width=4 if hot else 2,
+                        )
+                    # sky-blue connectors across each internal join,
+                    # drawn over the sand so the join stays visible
+                    for rr in range(run_top, run_bottom):
+                        if open_below(rr, c):
+                            gy = rr * cell_size + cell_size - margin
+                            self.canvas.create_line(
+                                mid1, gy, mid2, gy, fill="#0ea5e9", width=4,
+                                capstyle="butt",
+                            )
+                            self.canvas.create_line(
+                                (cx1 + cx2) / 2, gy - 5,
+                                (cx1 + cx2) / 2, gy + 5,
+                                fill="#0ea5e9", width=2,
+                            )
+
+                    # labels as white badges so they stay readable on sand
+                    for rr in range(run_top, run_bottom + 1):
+                        lvl = interp(rr, c)
+                        if lvl > 0.05:
+                            text = labels[1] if lvl < FULL else labels[FULL]
+                            tx = (cx1 + cx2) / 2
+                            ty = rr * cell_size + margin + 12
+                            self.canvas.create_rectangle(
+                                tx - 22, ty - 9, tx + 22, ty + 9,
+                                fill="#ffffff", outline="#334155", width=1,
+                            )
+                            self.canvas.create_text(
+                                tx, ty, text=text, fill="#1e293b",
+                                font=("Segoe UI", 9, "bold"),
+                            )
+
+            # --- gate-flash arrows (drawn last, on top of everything) ---
+            if gate_flash is not None:
+                gr, gc, gdir = gate_flash
+                gx1 = gc * cell_size + margin
+                gy1 = gr * cell_size + margin
+                gx2 = gx1 + cell_size - 2 * margin
+                gy2 = gy1 + cell_size - 2 * margin
+                mid1 = (gx1 + gx2) / 2 - gate_w / 2
+                mid2 = (gx1 + gx2) / 2 + gate_w / 2
+                pulse = "#0ea5e9" if t < 1 else "#64748b"
+                if gdir == "down":
+                    self.canvas.create_line(
+                        mid1, gy2 + 1, mid2, gy2 + 1, fill=pulse, width=5
+                    )
+                    arrow_y = gy2 + 10 + 6 * (1 - t)
+                    self.canvas.create_line(
+                        (gx1 + gx2) / 2, gy2 + 3,
+                        (gx1 + gx2) / 2, arrow_y,
+                        arrow="last", fill=pulse, width=2,
+                    )
+                else:
+                    if gdir == "left":
+                        ax1, ax2 = gx1 - 14, gx1 - 2
+                    else:
+                        ax1, ax2 = gx2 + 2, gx2 + 14
+                    ay = (gy1 + gy2) / 2
+                    self.canvas.create_line(
+                        ax1, ay, ax2, ay,
+                        arrow="last" if gdir == "right" else "first",
+                        fill=pulse, width=2,
+                    )
             self.canvas.configure(
                 scrollregion=(0, 0, max(1, cols_count * cell_size), max(1, rows_count * cell_size))
             )
@@ -832,9 +970,46 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
                 )
             self.status_var.set(text)
 
-        def show_step(self) -> None:
+        def apply_speed(self) -> None:
+            """Map the 1..6 speed slider to the per-step delay in ms."""
+            self.step_delay_ms = [1600, 1100, 800, 650, 420, 250][max(0, min(5, self.speed_var.get() - 1))]
+
+        def gate_for_step(self, step_index: int) -> Optional[Action]:
+            if 1 <= step_index <= len(self.solution):
+                return self.solution[step_index - 1]
+            return None
+
+        def start_tween(self, gate: Optional[Action]) -> None:
+            """Animate from the previously displayed world to self.state."""
+            self.anim_gate = gate
+            self.animating = True
+            self.anim_t = 0.0
+            self.animate_tick()
+
+        def animate_tick(self) -> None:
+            if not self.animating:
+                return
+            self.anim_t = min(1.0, self.anim_t + 0.12)
+            self.draw_board(self.anim_gate, self.anim_t)
+            if self.anim_t < 1.0:
+                self.root.after(16, self.animate_tick)
+            else:
+                self.animating = False
+                self.anim_from = None
+                self.anim_gate = None
+                self.draw_board()
+                if self.playing:
+                    self.root.after(self.step_delay_ms, self.advance_playback)
+
+        def show_step(self, animate: bool = True) -> None:
+            previous = self.state
             self.state = self.solution_states[self.step_index]
-            self.draw_board()
+            gate = self.gate_for_step(self.step_index)
+            if animate and not self.animating and previous != self.state:
+                self.anim_from = previous
+                self.start_tween(gate)
+            else:
+                self.draw_board()
             self.update_status()
 
         def next(self) -> None:
@@ -843,7 +1018,7 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
                 return
             self.step_index += 1
             self.show_step()
-            if self.step_index == len(self.solution):
+            if not self.animating and self.step_index == len(self.solution):
                 self.stop_playback()
 
         def previous(self) -> None:
@@ -856,7 +1031,7 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.stop_playback()
             if self.solution_states:
                 self.step_index = 0
-                self.show_step()
+                self.show_step(animate=False)
 
         def toggle_play(self) -> None:
             if self.playing:
@@ -864,25 +1039,35 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             elif self.solution:
                 if self.step_index >= len(self.solution):
                     self.step_index = 0
-                    self.show_step()
+                    self.show_step(animate=False)
                 self.playing = True
                 self.play_button.configure(text="Pause")
                 self.advance_playback()
 
         def advance_playback(self) -> None:
-            if not self.playing:
+            if not self.playing or self.animating:
                 return
             self.next()
-            if self.playing:
-                self.root.after(650, self.advance_playback)
+            # Continuation is normally handled by animate_tick; if no tween
+            # ran (identical consecutive states), advance directly.
+            if self.playing and not self.animating:
+                if self.step_index >= len(self.solution):
+                    self.stop_playback()
+                else:
+                    self.root.after(self.step_delay_ms, self.advance_playback)
 
         def stop_playback(self) -> None:
             self.playing = False
             self.play_button.configure(text="Play")
 
     root = tk.Tk()
-    SandPuzzleApp(root)
+    app = SandPuzzleApp(root)
+    root._app_probe = app
+    import os
+    if getattr(root, "_scripted", False) or os.environ.get("SANDBOX_SCRIPTED") == "1":
+        return app
     root.mainloop()
+    return app
 
 
 def parse_args() -> argparse.Namespace:

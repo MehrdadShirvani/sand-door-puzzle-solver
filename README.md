@@ -275,8 +275,16 @@ CLI flags:
 - **Click any cell** to cycle it between empty → half-full → full.
 - **Solve** runs the chosen algorithm on a background thread (the UI stays
   responsive), then **Play / Pause / Next / Previous / Reset** step through the
-  plan as an animation. The status bar shows the number of openings and the
-  weighted cost of the plan.
+  plan as an animated sequence:
+  - cells are drawn as **sand tanks** whose fill height tracks the sand level,
+  - between steps the sand levels **slide smoothly** to their new positions
+    instead of jumping,
+  - the **gate opened by the current step flashes** with an arrow showing the
+    transfer direction, until the next step begins,
+  - **joined cells render as one connected body**: the shared edge opens up and
+    the sand flows visually through the gate gap,
+  - a **Speed slider** (1–6) controls the per-step delay (1.6 s down to 0.25 s).
+- The status bar shows the number of openings and the weighted cost of the plan.
 
 ## Special test case
 
