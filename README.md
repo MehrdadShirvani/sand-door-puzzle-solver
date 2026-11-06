@@ -2,9 +2,87 @@
 
 A solver and visualizer for the "sand door" grid puzzle. Sand drains through
 gates in a grid of cells, and the goal is to find the cheapest plan that empties
-the whole grid. Five search algorithms are implemented — **DFS**, **BFS**,
-**IDS**, **UCS**, and a special **Greedy** scan — and any of them can be picked
-from the GUI or the command line.
+the whole grid. Seven search algorithms are implemented — **DFS**, **BFS**,
+**IDS**, **UCS**, **A\* (sand)**, **A\* (column)**, and a special **Greedy**
+scan — and any of them can be picked from the GUI or the command line.
+
+## How to start
+
+### Prerequisites
+
+- **Python 3.9 or newer** — the code uses `list[str]`-style generics and the
+  GUI is built with **Tkinter**, which ships with the standard CPython
+  installer on Windows (`python.org` downloads include `tcl/tk` by default).
+- **No third-party packages.** There is no `pip install` step, no virtualenv,
+  and no build step — the whole project is a single script, [`problem.py`](problem.py).
+- On Linux you may need the Tk package separately (`sudo apt install
+  python3-tk`); on macOS the standard installer or Homebrew Python already has
+  it. Windows needs nothing extra.
+
+Check that you have a suitable interpreter:
+
+```powershell
+python --version        # should print Python 3.9.x or newer
+python -c "import tkinter; print('Tkinter OK')"
+```
+
+### Getting the project
+
+Just place `problem.py` (and this `README.md`) anywhere you like — no other
+files are needed. If it is inside a git repository:
+
+```powershell
+git clone <repository-url>
+cd <repository-folder>
+```
+
+### Running it
+
+From the project folder:
+
+```powershell
+# 1. Launch the GUI (default mode)
+python problem.py
+
+# 2. Or run a quick CLI solve of the fixed special-case board
+python problem.py --cli --special-case --algo "A* (column)" --no-animate
+```
+
+The first command opens a window: set **Rows / Columns / Seed** or click
+**Special case**, choose an **Algorithm** from the dropdown (DFS, BFS, IDS,
+UCS, A* (sand), A* (column), Greedy), then press **Solve** and use
+**Play / Next / Previous** to watch the plan unfold.
+
+The second prints the board, the plan, and the weighted cost directly in the
+terminal — useful for quick checks and for scripting.
+
+### All CLI commands in one place
+
+```powershell
+# GUI (default)
+python problem.py
+
+# GUI, 5x5 board, reproducible via seed
+python problem.py --rows 5 --cols 5 --seed 42
+
+# CLI with a random board, animated output (default algorithm: BFS)
+python problem.py --cli
+
+# CLI, pick any algorithm: DFS | BFS | IDS | UCS | "A* (sand)" | "A* (column)" | Greedy
+python problem.py --cli --algo UCS
+python problem.py --cli --algo "A* (column)"
+
+# CLI on the fixed 4x2 special-case board, plan only (no animation)
+python problem.py --cli --special-case --algo Greedy --no-animate
+
+# CLI with animation, 0.3 s between frames
+python problem.py --cli --special-case --delay 0.3
+
+# Custom board size and seed on the CLI
+python problem.py --cli --rows 4 --cols 4 --seed 7
+```
+
+Full flag reference is in the [Usage](#usage) section below.
 
 ## Problem Statement
 
@@ -179,7 +257,7 @@ CLI flags:
 ### GUI
 
 - **Rows / Columns / Seed** — configure and regenerate the random board.
-- **Algorithm** — dropdown to select `DFS`, `BFS`, `IDS`, `UCS`, or `Greedy`.
+- **Algorithm** — dropdown to select `DFS`, `BFS`, `IDS`, `UCS`, `A* (sand)`, `A* (column)`, or `Greedy`.
 - **Special case** — one click loads the fixed test grid.
 - **Click any cell** to cycle it between empty → half-full → full.
 - **Solve** runs the chosen algorithm on a background thread (the UI stays
