@@ -80,7 +80,17 @@ python problem.py --cli --special-case --delay 0.3
 
 # Custom board size and seed on the CLI
 python problem.py --cli --rows 4 --cols 4 --seed 7
+
+# Exhaustive analysis: enumerate initial states of an r x c board, compare
+# Greedy vs. the optimum, and write a CSV + histogram + 2 scatter plots to
+# analysis_output/ (requires matplotlib: pip install matplotlib)
+python problem.py --analyze --rows 2 --cols 2
+python problem.py --analyze --rows 2 --cols 3 --sample 400
 ```
+
+The same analysis is also available in the GUI via the **Analyze** button: it
+uses the Rows/Columns spinboxes as the board size (up to 4×4) and reports
+progress in the status bar while a background thread crunches the states.
 
 Full flag reference is in the [Usage](#usage) section below.
 
@@ -238,6 +248,33 @@ probability `0.5`, half-full with probability `0.25`, and full with probability
 `0.25` — i.e. roughly half of the cells are empty and the rest are split evenly
 between half-full and full. A seed makes boards reproducible.
 
+`analysis.py` enumerates every possible initial state (each cell independently
+empty / half / full — 3^(r·c) boards), solves each one with the cost-optimal
+A\* solver and with the Greedy strategy, and records:
+
+- `opt_cost`, `greedy_cost`
+- `Greedy_opt_ratio = greedy cost / optimum cost`
+- the optimal plan's length and how many of its actions are **type-B** (side
+door) openings
+
+and writes to `analysis_output/`:
+
+1. **Histogram** of the `Greedy_opt_ratio` frequencies.
+2. **Plot 1** — scatter: x = greedy cost, y = optimal cost (with a y = x
+   reference; every point lies on or below it).
+3. **Plot 2** — scatter: x = optimal plan length (actions to the goal),
+   y = number of type-B actions in the optimal plan.
+
+plus a CSV with the raw per-state results and a textual summary (share of
+states where greedy is exactly optimal, mean/worst ratio, worst board).
+
+It can be launched through `problem.py --analyze` (CLI) or the GUI's
+**Analyze** button, or directly via `python analysis.py` with the same
+`--rows/--cols/--sample/--seed` flags.
+
+Typical full 2×2 enumeration (80 solvable boards): greedy is exactly optimal
+on 77.5% of boards, mean ratio 1.029, worst ratio 1.176.
+
 ## Usage
 
 Requirements: Python 3.9+ (the GUI uses Tkinter, bundled with CPython on
@@ -266,12 +303,18 @@ CLI flags:
 | `--seed N`       | Seed for the random board.                                         |
 | `--delay S`      | Seconds between animation frames in the CLI (default `0.7`).       |
 | `--no-animate`   | Print the plan only, skip the step-by-step animation.              |
+| `--analyze`      | Exhaustive analysis mode (see above) instead of solving one board. |
+| `--sample N`     | With `--analyze`: analyse only N randomly-picked states.           |
 
 ### GUI
 
 - **Rows / Columns / Seed** — configure and regenerate the random board.
 - **Algorithm** — dropdown to select `DFS`, `BFS`, `IDS`, `UCS`, `A* (sand)`, `A* (column)`, or `Greedy`.
 - **Special case** — one click loads the fixed test grid.
+- **Analyze** — runs the exhaustive Greedy-vs-optimal analysis (histogram of
+  `Greedy_opt_ratio`, greedy-vs-optimal scatter, and plan-length-vs-side-door
+  scatter) for the board size set in Rows/Columns, in a background thread;
+  outputs land in `analysis_output/`.
 - **Click any cell** to cycle it between empty → half-full → full.
 - **Solve** runs the chosen algorithm on a background thread (the UI stays
   responsive), then **Play / Pause / Next / Previous / Reset** step through the
