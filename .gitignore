@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Analysis / experiment outputs
+analysis_output/
+*.png
+*.ps
+*.pdf
+
+# Throwaway probes and logs (keep analysis.py itself)
+shot_probe.py
+render_probe.py
+geometry_probe.py
+gui_probe.py
+test_*.py
+probe_out.txt
+probe_err.txt
+probe_run.log

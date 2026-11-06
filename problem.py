@@ -661,6 +661,8 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.special_button.grid(row=0, column=9, padx=4)
             self.solve_button = ttk.Button(controls, text="Solve", command=self.solve)
             self.solve_button.grid(row=0, column=10, padx=4)
+            self.analyze_button = ttk.Button(controls, text="Analyze", command=self.run_analysis)
+            self.analyze_button.grid(row=0, column=11, padx=4)
 
             board_frame = ttk.Frame(root, padding=(10, 0, 10, 6))
             board_frame.pack(fill="both", expand=True)
@@ -914,6 +916,7 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
             self.solve_button.configure(state="disabled")
             self.random_button.configure(state="disabled")
             self.special_button.configure(state="disabled")
+            self.analyze_button.configure(state="disabled")
             self.status_var.set(f"Searching with {self.algorithm}...")
             start_state = self.state
 
@@ -925,16 +928,84 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
 
             threading.Thread(target=search, daemon=True).start()
 
+        def run_analysis(self) -> None:
+            """Run the exhaustive Greedy-vs-optimal analysis in the background.
+
+            Uses the Rows/Columns spinboxes as the board size and analyses ALL
+            3^(rows*cols) initial states (or warns when that is too many).
+            Results (CSV + PNGs) are written to analysis_output/.
+            """
+            if self.solving:
+                return
+            self.solving = True
+            self.solve_button.configure(state="disabled")
+            self.random_button.configure(state="disabled")
+            self.special_button.configure(state="disabled")
+            self.analyze_button.configure(state="disabled")
+            try:
+                rows = int(self.rows_var.get())
+                cols = int(self.cols_var.get())
+                if not 1 <= rows <= 4 or not 1 <= cols <= 4:
+                    raise ValueError("Analysis supports boards up to 4x4 (3^16 states).")
+                n_states = 3 ** (rows * cols)
+            except ValueError as error:
+                messagebox.showerror("Invalid analysis settings", str(error), parent=self.root)
+                self.solving = False
+                self.solve_button.configure(state="normal")
+                self.random_button.configure(state="normal")
+                self.special_button.configure(state="normal")
+                self.analyze_button.configure(state="normal")
+                return
+            self.status_var.set(f"Analysing {n_states} states of the {rows}x{cols} board...")
+
+            def worker() -> None:
+                try:
+                    import analysis as analysis_mod
+                    import os
+                    os.makedirs(analysis_mod.OUT_DIR, exist_ok=True)
+                    results = analysis_mod.analyse(rows, cols)
+                    if results:
+                        csv_path = os.path.join(analysis_mod.OUT_DIR, f"results_{rows}x{cols}.csv")
+                        analysis_mod.save_csv(results, csv_path)
+                        analysis_mod.make_plots(results, analysis_mod.OUT_DIR)
+                        analysis_mod.print_summary(results)
+                        result_queue.put(("__analysis__", (rows, cols, len(results)), None))
+                    else:
+                        result_queue.put(("__analysis__", None, RuntimeError("No solvable states found.")))
+                except Exception as error:
+                    result_queue.put(("__analysis__", None, error))
+
+            threading.Thread(target=worker, daemon=True).start()
+
         def check_solver_result(self) -> None:
             try:
-                start_state, actions, error = result_queue.get_nowait()
+                start_state, payload, error = result_queue.get_nowait()
             except queue.Empty:
                 self.root.after(100, self.check_solver_result)
                 return
+            if start_state == "__analysis__":
+                self.solving = False
+                self.solve_button.configure(state="normal")
+                self.random_button.configure(state="normal")
+                self.special_button.configure(state="normal")
+                self.analyze_button.configure(state="normal")
+                if error is not None:
+                    messagebox.showerror("Analysis failed", str(error), parent=self.root)
+                    self.status_var.set("Analysis failed.")
+                else:
+                    rows, cols, count = payload
+                    self.status_var.set(
+                        f"Analysis done: {count} states -> analysis_output/ "
+                        f"(results_{rows}x{cols}.csv + 3 PNG plots)"
+                    )
+                self.root.after(100, self.check_solver_result)
+                return
+            actions, error = payload, error
             self.solving = False
             self.solve_button.configure(state="normal")
             self.random_button.configure(state="normal")
             self.special_button.configure(state="normal")
+            self.analyze_button.configure(state="normal")
             if start_state == self.state:
                 if error is not None:
                     messagebox.showerror("Unable to solve puzzle", str(error), parent=self.root)
@@ -1082,11 +1153,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation.")
     parser.add_argument("--delay", type=float, default=0.7, help="Seconds to pause between animation frames.")
     parser.add_argument("--no-animate", action="store_true", help="Do not animate the solution. Only print the action list.")
+    parser.add_argument(
+        "--analyze", action="store_true",
+        help="Exhaustive analysis mode: enumerate initial states, compare Greedy "
+             "against the optimum, and write histogram analysis_output/. "
+             "Use with --rows/--cols and optionally --sample N. Requires matplotlib."
+    )
+    parser.add_argument(
+        "--sample", type=int, default=None,
+        help="With --analyze: analyse a random sample of N states instead of all."
+    )
     return parser.parse_args()
+
+
+def run_analysis(args: argparse.Namespace) -> None:
+    """Delegate to analysis.py (imported lazily to avoid a circular import)."""
+    try:
+        import analysis
+    except ImportError as error:
+        print("Analysis requires matplotlib:", error)
+        print("Install it with:  pip install matplotlib")
+        return
+    rows = args.rows or 2
+    cols = args.cols or 2
+    # analysis.parse-free entry point: replicate its main() with our args.
+    import os
+    os.makedirs(analysis.OUT_DIR, exist_ok=True)
+    results = analysis.analyse(rows, cols, limit=args.sample, seed=args.seed)
+    if not results:
+        print("No results - nothing to plot.")
+        return
+    csv_path = os.path.join(analysis.OUT_DIR, f"results_{rows}x{cols}.csv")
+    analysis.save_csv(results, csv_path)
+    analysis.make_plots(results, analysis.OUT_DIR)
+    analysis.print_summary(results)
 
 
 def main() -> None:
     args = parse_args()
+    if args.analyze:
+        run_analysis(args)
+        return
     if not args.cli:
         run_gui(args.rows or 3, args.cols or 4, args.seed, algorithm=args.algo)
         return
