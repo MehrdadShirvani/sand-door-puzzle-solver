@@ -573,6 +573,14 @@ def solve_min_actions(initial_state: State) -> List[Action]:
     return solve_bfs(initial_state)
 
 
+def is_valid_action(state, action: Action) -> bool:
+    """An action is valid only if the cell/direction exists AND applying it
+    genuinely changes the state (no-op door openings are rejected)."""
+    if action not in iter_actions(state):
+        return False
+    return apply_action(state, *action) != state
+
+
 def path_cost(initial_state: State, actions: Sequence[Action]) -> int:
     """Total weighted cost of a plan under the gate/side-door cost model."""
     state = initial_state
@@ -581,6 +589,35 @@ def path_cost(initial_state: State, actions: Sequence[Action]) -> int:
         total += action_cost(state, action)
         state = apply_action(state, *action)
     return total
+
+
+def path_score(initial_state: State, actions: Sequence[Action]) -> int:
+    """Score of a complete plan: the NEGATIVE weighted path cost.
+
+    path_score(initial_state, actions) == -path_cost(initial_state, actions)
+
+    A path must be a sequence of valid, state-changing actions that ends in
+    the empty-board goal.  It raises ValueError when it is incomplete,
+    contains an invalid (or no-op) action, or does not reach the goal.
+    """
+    state = initial_state
+    total = 0
+    for index, action in enumerate(actions, start=1):
+        if not is_valid_action(state, action):
+            grid, _ = unpack(state)
+            row, col, direction = action
+            raise ValueError(
+                f"Invalid action #{index} {action!r}: opening the {direction} "
+                f"door at ({row}, {col}) is not legal in state\n"
+                + "\n".join(" ".join(str(c) for c in r) for r in grid)
+            )
+        total += action_cost(state, action)
+        state = apply_action(state, *action)
+    if not is_empty_state(state):
+        raise ValueError(
+            "Incomplete path: the plan does not reach the empty-board goal."
+        )
+    return -total
 
 
 # ---------------------------------------------------------------------------
