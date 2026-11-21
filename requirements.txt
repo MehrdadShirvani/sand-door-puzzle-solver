@@ -1,0 +1,5 @@
+# Core solver: Python 3.9+ standard library only - no third-party packages
+# are required for problem.py, the CLI, the unit tests, or evaluate_boards.py.
+#
+# Optional dependencies:
+matplotlib>=3.5 ; # required ONLY for analysis.py (--analyze) plot generation

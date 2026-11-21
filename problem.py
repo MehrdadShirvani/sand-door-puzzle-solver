@@ -26,7 +26,9 @@ HALF = 1  # half-full, stored in half-units (0.5 sand)
 FULL = 2  # full of sand (1.0 sand)
 
 EMPTY_COST_VALUE = 0.0
-ALGORITHMS = ("DFS", "BFS", "IDS", "UCS", "Greedy", "A* (sand)", "A* (column)")
+ALGORITHMS = (
+    "DFS", "BFS", "IDS", "UCS", "Greedy", "A* (sand)", "A* (column)", "Local Search",
+)
 
 
 def to_half_units(values: Sequence[Sequence[float]]) -> State:
@@ -560,12 +562,261 @@ SOLVERS = {
 }
 
 
+def solve_local_search(
+    initial_state: State,
+    iterations: int = 60,
+    seed: int | None = None,
+    rng: "random.Random | None" = None,
+) -> List[Action]:
+    """Hill-climbing local search over door-opening plans.
+
+    Starts from the deterministic Greedy plan and repeatedly tries to improve
+    it by mutating one action at a time (replace / insert / delete), keeping a
+    mutation only when the resulting plan is still valid and does not score
+    worse than the current one.  The plan score is the NEGATIVE weighted cost
+    (see `path_score`), so hill-climbing minimises the cost.
+
+    Guarantees:
+
+    - an already-empty board returns [] immediately;
+    - every accepted neighbour is validated by `path_score`, which rejects
+      incomplete, invalid and no-op plans;
+    - the returned plan always reaches the empty-board goal (a plan is only
+      returned after it has scored successfully, i.e. reached the goal);
+    - the initial Greedy plan is never discarded for a worse one, so the
+      result is never more costly than Greedy would be;
+    - reproducible: pass a `seed` (or an `rng`) to get the same result for
+      the same board; without a seed the search is still deterministic in
+      outcome quality because it starts from Greedy and never regresses.
+
+    Raises ValueError (via the Greedy fallback) if no solution exists.
+    """
+    if is_empty_state(initial_state):
+        return []
+
+    rng = rng if rng is not None else random.Random(seed)
+
+    # Starting point: the deterministic greedy plan (always reaches the goal).
+    try:
+        current = list(solve_greedy(initial_state))
+    except ValueError as error:
+        raise ValueError(f"Local search found no solution: {error}") from error
+    current_score = path_score(initial_state, current)
+
+    attempts = max(1, iterations) * max(1, len(current))
+    for _ in range(attempts):
+        if len(current) < 2:
+            break  # nothing left to mutate meaningfully
+        neighbour = list(current)
+        kind = rng.random()
+        index = rng.randrange(len(neighbour))
+        grid_before = _state_after(initial_state, neighbour[:index])
+        if kind < 0.45:
+            # Replace one action with a different valid action at that point.
+            options = [
+                a for a in iter_actions(grid_before)
+                if a != neighbour[index]
+            ]
+            if not options:
+                continue
+            neighbour[index] = rng.choice(options)
+        elif kind < 0.75 and index + 1 < len(neighbour):
+            # Swap two adjacent actions.
+            neighbour[index], neighbour[index + 1] = (
+                neighbour[index + 1], neighbour[index]
+            )
+        else:
+            # Delete a redundant action.
+            del neighbour[index]
+
+        try:
+            score = path_score(initial_state, neighbour)
+        except ValueError:
+            continue  # invalid, incomplete or no-op mutation: rejected
+        if score >= current_score:
+            current, current_score = neighbour, score
+
+    path_score(initial_state, current)  # final safety validation
+    return current
+
+
+def _state_after(initial_state: State, actions: Sequence[Action]) -> State:
+    """State reached from initial_state after applying a prefix of actions."""
+    state = initial_state
+    for action in actions:
+        state = apply_action(state, *action)
+    return state
+
+
+SOLVERS = {
+    "DFS": solve_dfs,
+    "BFS": solve_bfs,
+    "IDS": solve_ids,
+    "UCS": solve_ucs,
+    "Greedy": solve_greedy,
+    "A* (sand)": lambda state: solve_astar(state, heuristic_sand),
+    "A* (column)": lambda state: solve_astar(state, heuristic_column),
+    "Local Search": solve_local_search,
+}
+
+
 def solve(algorithm: str, initial_state: State) -> List[Action]:
     try:
         solver = SOLVERS[algorithm]
     except KeyError:
         raise ValueError(f"Unknown algorithm {algorithm!r}. Choose one of {ALGORITHMS}.")
     return solver(initial_state)
+
+
+# ---------------------------------------------------------------------------
+# Effective branching factor
+# ---------------------------------------------------------------------------
+
+
+def effective_branching_factor(n_expanded: int, depth: int) -> Optional[float]:
+    """Estimate the effective branching factor b of a search.
+
+    For a search that expanded N nodes and found a solution at depth d, b
+    solves
+
+        N = 1 + b + b^2 + ... + b^d = (b^(d+1) - 1) / (b - 1)   (b != 1)
+
+    found here by bisection on b in (1, 100].
+
+    Edge cases (no division by zero or numerical blow-up):
+
+    - N <= 1 or d == 0: only the root was expanded, branching is undefined;
+      None is returned.
+    - d == 1: N = 1 + b, so b = N - 1 exactly.
+    - N == d + 1 (a bare chain): b = 1 exactly.
+
+    Limitations: b assumes a UNIFORM search tree - constant branching,
+    goal only at depth d, no pruning or duplicate detection. Real searches
+    revisit-prune and use heuristics, so b is a rough size-comparison
+    metric between algorithms on the SAME problem, not the true branching
+    factor of the state space.
+    """
+    if n_expanded <= 1 or depth <= 0:
+        return None  # degenerate: no measurable branching
+    if depth == 1:
+        return float(n_expanded - 1)
+    if n_expanded == depth + 1:
+        return 1.0
+
+    def total(b: float) -> float:
+        if abs(b - 1.0) < 1e-9:
+            return float(depth + 1)
+        return (b ** (depth + 1) - 1.0) / (b - 1.0)
+
+    lo, hi = 1.0 + 1e-7, 100.0
+    if total(hi) < n_expanded:
+        return None  # outside the representable range
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if total(mid) < n_expanded:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2.0, 6)
+
+
+def count_nodes(algorithm: str, initial_state: State) -> int:
+    """Run a solver and return how many successor expansions it performed.
+
+    Implemented by temporarily wrapping the module-level `successors`
+    function; the original is restored even if the search raises.
+    """
+    counter = {"n": 0}
+    original = globals()["successors"]
+
+    def counting(state):
+        counter["n"] += 1
+        return original(state)
+
+    globals()["successors"] = counting
+    try:
+        solve(algorithm, initial_state)
+    finally:
+        globals()["successors"] = original
+    return counter["n"]
+
+
+def solve_min_actions(initial_state: State) -> List[Action]:
+    """Backwards-compatible alias for the BFS solver."""
+    return solve_bfs(initial_state)
+
+
+# ---------------------------------------------------------------------------
+# Effective branching factor
+# ---------------------------------------------------------------------------
+
+
+def effective_branching_factor(n_expanded: int, depth: int) -> Optional[float]:
+    """Estimate the effective branching factor b of a search.
+
+    For a search that expanded N nodes and found a solution at depth d, b is
+    the solution of
+
+        N = 1 + b + b^2 + ... + b^d = (b^(d+1) - 1) / (b - 1)   (b != 1)
+
+    which is found by bisection on b in [1.0000001, 100].
+
+    Edge cases (no division by zero or numerical blow-up):
+
+    - N <= 1 or d == 0: only the root was expanded (N = 1), so no branching
+      information exists and b is undefined; None is returned.
+    - d == 1: N = 1 + b, so b = N - 1 exactly.
+    - N == 1 + d (a bare chain): b = 1 exactly.
+
+    Limitations: b assumes a UNIFORM tree - constant branching, goal only at
+    depth d, no pruning or revisits. Real searches have duplicate detection
+    and prune dominated states, so b is a rough size-comparison metric
+    between algorithms on the SAME problem, not a true branching factor.
+    """
+    if n_expanded <= 1 or depth <= 0:
+        return None  # degenerate: no measurable branching
+    if depth == 1:
+        return float(n_expanded - 1)
+    if n_expanded == depth + 1:
+        return 1.0
+
+    def total(b: float) -> float:
+        # (b^(d+1) - 1) / (b - 1), stable for b near 1 via the direct sum.
+        if abs(b - 1.0) < 1e-9:
+            return float(depth + 1)
+        return (b ** (depth + 1) - 1.0) / (b - 1.0)
+
+    lo, hi = 1.0 + 1e-7, 100.0
+    if total(hi) < n_expanded:
+        return None  # beyond the representable range
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if total(mid) < n_expanded:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2.0, 6)
+
+
+def count_nodes(algorithm: str, initial_state: State) -> int:
+    """Run a solver and return the number of successor expansions it made.
+
+    Implemented by temporarily wrapping the module-level `successors`
+    function; the counter is restored afterwards even if the search raises.
+    """
+    counter = {"n": 0}
+    original = globals()["successors"]
+
+    def counting(state):
+        counter["n"] += 1
+        return original(state)
+
+    globals()["successors"] = counting
+    try:
+        solve(algorithm, initial_state)
+    finally:
+        globals()["successors"] = original
+    return counter["n"]
 
 
 def solve_min_actions(initial_state: State) -> List[Action]:
@@ -575,10 +826,19 @@ def solve_min_actions(initial_state: State) -> List[Action]:
 
 def is_valid_action(state, action: Action) -> bool:
     """An action is valid only if the cell/direction exists AND applying it
-    genuinely changes the state (no-op door openings are rejected)."""
+    genuinely changes the sand (no-op door openings are rejected).
+
+    The comparison uses only the grid and the join set — i.e. the actual
+    puzzle state — not the outer state-vs-world encoding: applying an action
+    to a plain State returns a World (grid + empty joins) even when nothing
+    changed, and a bare equality test would mistake that re-encoding for a
+    real transition.
+    """
     if action not in iter_actions(state):
         return False
-    return apply_action(state, *action) != state
+    before = unpack(state)
+    after = unpack(apply_action(state, *action))
+    return after[0] != before[0] or after[1] != before[1]
 
 
 def path_cost(initial_state: State, actions: Sequence[Action]) -> int:
@@ -1180,13 +1440,14 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Solve the sand-door puzzle with DFS, BFS, IDS, UCS, Greedy or A* and visualize the plan."
+        description="Solve the sand-door puzzle with DFS, BFS, IDS, UCS, Greedy, A*, "
+                    "or Local Search and visualize the plan."
     )
     parser.add_argument("--cli", action="store_true", help="Run the command-line interface instead of the GUI.")
     parser.add_argument("--algo", choices=ALGORITHMS, default="BFS", help="Search algorithm to use (default: BFS).")
     parser.add_argument("--special-case", action="store_true", help="Use the fixed 4x2 test grid instead of a random board.")
-    parser.add_argument("--rows", type=int, default=None, help="Number of rows in the grid.")
-    parser.add_argument("--cols", type=int, default=None, help="Number of columns in the grid.")
+    parser.add_argument("--rows", type=int, default=None, help="Number of rows in the grid (1-12).")
+    parser.add_argument("--cols", type=int, default=None, help="Number of columns in the grid (1-12).")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation.")
     parser.add_argument("--delay", type=float, default=0.7, help="Seconds to pause between animation frames.")
     parser.add_argument("--no-animate", action="store_true", help="Do not animate the solution. Only print the action list.")
@@ -1200,7 +1461,31 @@ def parse_args() -> argparse.Namespace:
         "--sample", type=int, default=None,
         help="With --analyze: analyse a random sample of N states instead of all."
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_args(args)
+    return args
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Reject invalid algorithm names, board dimensions, seeds and samples."""
+    if args.algo not in ALGORITHMS:
+        # Unreachable through argparse choices, but keeps programmatic use safe.
+        raise SystemExit(
+            f"error: unknown algorithm {args.algo!r}. "
+            f"Choose one of: {', '.join(ALGORITHMS)}"
+        )
+    for name in ("rows", "cols"):
+        value = getattr(args, name)
+        if value is not None and not 1 <= value <= 12:
+            raise SystemExit(f"error: --{name} must be between 1 and 12 (got {value}).")
+    if args.seed is not None and args.seed < 0:
+        raise SystemExit(f"error: --seed must be a non-negative integer (got {args.seed}).")
+    if args.sample is not None and args.sample <= 0:
+        raise SystemExit(f"error: --sample must be a positive integer (got {args.sample}).")
+    if args.delay < 0:
+        raise SystemExit(f"error: --delay must be non-negative (got {args.delay}).")
+    if args.analyze and (args.rows or 2) * (args.cols or 2) > 16:
+        raise SystemExit("error: analysis supports boards up to 4x4 (3^16 states).")
 
 
 def run_analysis(args: argparse.Namespace) -> None:
@@ -1247,9 +1532,35 @@ def main() -> None:
 
     print_grid(initial_state)
 
-    actions = solve(args.algo, initial_state)
+    # Instrument the solver: count successor expansions and measure time.
+    expansion_counter = {"nodes": 0}
+    original_successors = successors
+
+    def counting_successors(state):
+        expansion_counter["nodes"] += 1
+        return original_successors(state)
+
+    # Rebind the module-level name so the search functions (which resolve
+    # `successors` through module globals at call time) see the wrapper.
+    globals()["successors"] = counting_successors
+    try:
+        started = time.perf_counter()
+        actions = solve(args.algo, initial_state)
+        elapsed = time.perf_counter() - started
+    finally:
+        globals()["successors"] = original_successors
+
     total_cost = path_cost(initial_state, actions)
-    print(f"{args.algo}: {len(actions)} door openings, weighted cost {total_cost}")
+    goal_reached = is_empty_state(_state_after(initial_state, actions))
+
+    print(f"Algorithm          : {args.algo}")
+    print(f"Door openings      : {len(actions)}")
+    print(f"Weighted total cost: {total_cost}")
+    print(f"Goal state reached : {'yes' if goal_reached else 'NO'}")
+    print(f"Execution time     : {elapsed:.3f} s")
+    print(f"Node expansions    : {expansion_counter['nodes']}")
+    ebf = effective_branching_factor(expansion_counter["nodes"], len(actions))
+    print(f"Effective b-factor : " + (f"{ebf:.3f}" if ebf is not None else "n/a"))
     if actions:
         print("Actions:")
         for index, action in enumerate(actions, start=1):
@@ -1257,6 +1568,8 @@ def main() -> None:
             print(f"  {index}. open {direction} door at ({row}, {col})")
     else:
         print("No actions required; the grid is already empty.")
+    if not goal_reached:
+        raise SystemExit("error: the returned plan does not reach the empty-board goal.")
 
     if not args.no_animate and actions:
         print("\nAnimation:")
