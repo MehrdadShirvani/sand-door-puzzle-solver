@@ -21,8 +21,9 @@ Board configuration (documented for reproduction):
   random-3x4    3x4    7      generate_random_state(rng=Random(7))
   random-4x3    4x3    123    generate_random_state(rng=Random(123))
 
-Algorithms evaluated: UCS, A* (sand), A* (column), Greedy, Local Search.
-(Local Search uses seed=7, iterations=25.)
+Algorithms evaluated: UCS, A* (sand), A* (column), Greedy, Local Search, Genetic.
+(Local Search uses seed=7, iterations=25.  Genetic uses population 50,
+generations 200, mutation rate 0.08, deterministic selection, seed=7.)
 """
 
 from __future__ import annotations
@@ -35,8 +36,15 @@ import time
 import problem as p
 
 OUT_DIR = "analysis_output"
-ALGOS = ["UCS", "A* (sand)", "A* (column)", "Greedy", "Local Search"]
+ALGOS = ["UCS", "A* (sand)", "A* (column)", "Greedy", "Local Search", "Genetic"]
 LOCAL_SEARCH_KWARGS = {"iterations": 25, "seed": 7}
+GENETIC_KWARGS = {
+    "population_size": 50,
+    "generations": 200,
+    "mutation_rate": 0.08,
+    "selection": "deterministic",
+    "seed": 7,
+}
 
 
 def make_boards():
@@ -61,6 +69,10 @@ def run_one(algorithm: str, board) -> dict:
         started = time.perf_counter()
         if algorithm == "Local Search":
             actions = p.solve_local_search(board, **LOCAL_SEARCH_KWARGS)
+        elif algorithm == "Genetic":
+            # Fitness evaluations are not state expansions, so expanded_nodes
+            # stays at 0 for Genetic (documented in the README).
+            actions = p.solve_genetic(board, **GENETIC_KWARGS)
         else:
             actions = p.solve(algorithm, board)
         elapsed = time.perf_counter() - started

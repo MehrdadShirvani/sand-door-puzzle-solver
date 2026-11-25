@@ -28,6 +28,7 @@ FULL = 2  # full of sand (1.0 sand)
 EMPTY_COST_VALUE = 0.0
 ALGORITHMS = (
     "DFS", "BFS", "IDS", "UCS", "Greedy", "A* (sand)", "A* (column)", "Local Search",
+    "Genetic",
 )
 
 
@@ -657,6 +658,8 @@ SOLVERS = {
     "A* (sand)": lambda state: solve_astar(state, heuristic_sand),
     "A* (column)": lambda state: solve_astar(state, heuristic_column),
     "Local Search": solve_local_search,
+    # Lazy reference: solve_genetic is defined further down in the GA section.
+    "Genetic": lambda state: solve_genetic(state),
 }
 
 
@@ -878,6 +881,531 @@ def path_score(initial_state: State, actions: Sequence[Action]) -> int:
             "Incomplete path: the plan does not reach the empty-board goal."
         )
     return -total
+
+
+# ---------------------------------------------------------------------------
+# Genetic Algorithm chromosome model
+#
+# A chromosome (DNA) is a FIXED-length tuple of genes.  Each gene is either a
+# real action - the existing (row, col, direction) encoding - or the filler
+# gene NOOP = None.  A gene is only meaningful if it is a legal, state-changing
+# action in the state reached by the genes before it; anything else (an illegal
+# action, a no-op, a filler arriving too early) is treated as a skipped filler
+# and costs nothing.
+# ---------------------------------------------------------------------------
+
+NOOP: Optional[Action] = None  # the filler gene
+
+
+def max_len(initial_state: State) -> int:
+    """Fixed chromosome length: MAX_LEN = 2 * rows * cols.
+
+    Justification: every cell of sand needs at most a few door openings to
+    leave the grid (one bottom-gate opening per non-bottom cell plus roughly
+    one side door per half-unit and one exit per sand-bearing column), so
+    twice the number of cells is always a generous upper bound on the length
+    of a complete plan.
+    """
+    grid, _ = unpack(initial_state)
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 0
+    return 2 * rows * cols
+
+
+def random_chromosome(initial_state: State, rng: random.Random) -> Tuple[Optional[Action], ...]:
+    """Build a fixed-length DNA by walking a random path through the state space.
+
+    Repeatedly picks a random VALID successor action (successors()-style: it
+    must exist and actually change the board).  If the board becomes empty
+    before MAX_LEN genes are filled, the rest is filled with NOOP fillers so
+    every chromosome has exactly MAX_LEN genes.
+
+    Never mutates initial_state: apply_action always builds new tuples.
+    """
+    length = max_len(initial_state)
+    genes: List[Optional[Action]] = []
+    state = initial_state
+    while len(genes) < length and not is_empty_state(state):
+        options = [
+            action
+            for action in iter_actions(state)
+            if unpack(apply_action(state, *action)) != unpack(state)
+        ]
+        if not options:
+            break  # dead end (no legal state-changing action left)
+        action = rng.choice(options)
+        genes.append(action)
+        state = apply_action(state, *action)
+    genes.extend([NOOP] * (length - len(genes)))
+    return tuple(genes)
+
+
+def decode_dna(initial_state: State, dna: Sequence[Optional[Action]]) -> Tuple[List[Action], State, bool]:
+    """Repair a DNA into the effective plan it encodes.
+
+    Walks the genes from the initial state.  A gene is EXECUTED only when it is
+    a legal, state-changing action in the state reached so far; every other
+    gene (NOOP filler, illegal action, no-op action, or any gene after the
+    plan has stopped making sense) is repaired into a skipped filler with zero
+    cost.  Never raises on bad genes.
+
+    Returns (effective_actions, final_state, reached_goal):
+
+    - effective_actions: only the executed genes, in order;
+    - final_state: the board after applying them;
+    - reached_goal: True when final_state is the empty board.
+    """
+    state = initial_state
+    actions: List[Action] = []
+    for gene in dna:
+        if gene is None:
+            continue  # filler gene: skipped, zero cost
+        candidate = tuple(gene)
+        if candidate in iter_actions(state):
+            next_state = apply_action(state, *candidate)
+            if unpack(next_state) != unpack(state):
+                actions.append(candidate)  # type: ignore[arg-type]
+                state = next_state
+        # else: illegal or no-op gene -> treated as a filler, skipped.
+    return actions, state, is_empty_state(state)
+
+
+def state_after(initial_state: State, dna: Sequence[Optional[Action]]) -> State:
+    """State reached by applying the plan encoded in a DNA.
+
+    Applies genes in order and stops cleanly at the FIRST illegal gene (no
+    exception); fillers and every gene after that point are consumed as
+    skipped fillers.  initial_state is never mutated.
+    """
+    state = initial_state
+    for gene in dna:
+        if gene is None:
+            continue
+        candidate = tuple(gene)
+        if candidate in iter_actions(state):
+            next_state = apply_action(state, *candidate)
+            if unpack(next_state) == unpack(state):
+                break  # no-op gene: illegal as a plan step, stop cleanly
+            state = next_state
+        else:
+            break  # illegal gene: stop cleanly
+    return state
+
+
+def ga_goal_test(initial_state: State, dna: Sequence[Optional[Action]]) -> bool:
+    """Goal test for a GA chromosome: True when its decoded plan empties the board.
+
+    Uses the same repair rule as decode_dna, so it never raises - even for
+    random, crossover-generated or all-filler DNA.
+    """
+    return decode_dna(initial_state, dna)[2]
+
+
+def ga_path_cost(initial_state: State, dna: Sequence[Optional[Action]]) -> int:
+    """Weighted cost of the plan encoded in a GA chromosome.
+
+    Repair rule (the single documented rule, shared with decode_dna): genes are
+    walked in order from the initial state; a gene is EXECUTED only when it is
+    a legal, state-changing action in the state reached so far, and every other
+    gene (NOOP filler, illegal action, no-op action) is a skipped conflict with
+    zero cost.  Only executed actions contribute to the cost.  The walk never
+    stops early on a bad gene - it just skips it - so the function always
+    returns a non-negative int and never raises, for any DNA.
+    """
+    actions, _state, _goal = decode_dna(initial_state, dna)
+    return path_cost(initial_state, actions)
+
+
+# Fitness constants (documented once, used by fitness() only).
+FITNESS_BASE = 1_000_000.0   # large constant making every fitness positive
+CONFLICT_PENALTY = 1_000.0   # penalty per illegal / no-op / skipped gene
+HEURISTIC_WEIGHT = 50.0      # weight of heuristic_column on the final state
+FITNESS_FLOOR = 1e-6         # fixed positive lower bound for every fitness
+
+
+def fitness(initial_state: State, dna: Sequence[Optional[Action]]) -> float:
+    """Fitness of a GA chromosome (higher is better, always >= FITNESS_FLOOR).
+
+        fitness = FITNESS_BASE
+                  - CONFLICT_PENALTY * skipped_gene_count
+                  - ga_path_cost(initial_state, dna)
+                  - HEURISTIC_WEIGHT * heuristic_column(final_state)
+
+    - skipped genes: every gene that decode_dna's repair rule does not execute
+      (NOOP fillers, illegal actions, no-op actions);
+    - ga_path_cost: weighted cost of the executed part of the plan;
+    - heuristic_column is evaluated on the FINAL state produced by
+      decode_dna (how far the board still is from empty).
+
+    The result is clamped to FITNESS_FLOOR, so fitness is finite and positive
+    even for a chromosome whose penalties would exceed FITNESS_BASE (which
+    cannot happen for MAX_LEN-length DNA on supported board sizes, but the
+    clamp keeps the invariant explicit).  Malformed gene tuples and NOOP genes
+    are handled by the walk and never raise.
+
+    Repair rule (shared with decode_dna): genes are walked in order; a gene is
+    EXECUTED only when it is a legal, state-changing action in the state
+    reached so far.  Only skipped genes BEFORE the goal is reached count as
+    conflicts - NOOP fillers after a complete plan are the intended padding
+    and cost nothing, otherwise a short UCS plan padded with fillers would be
+    punished more than a wasteful random plan of the same length.
+    """
+    state = initial_state
+    executed: List[Action] = []
+    conflicts = 0
+    reached = is_empty_state(initial_state)
+    for gene in dna:
+        if not reached:
+            if gene is None:
+                conflicts += 1  # filler before the goal: skipped conflict
+                continue
+            candidate = tuple(gene)
+            if candidate in iter_actions(state):
+                next_state = apply_action(state, *candidate)
+                if unpack(next_state) != unpack(state):
+                    executed.append(candidate)  # type: ignore[arg-type]
+                    state = next_state
+                    if is_empty_state(state):
+                        reached = True
+                    continue
+            conflicts += 1  # illegal or no-op gene: skipped conflict
+        # genes after the goal (including trailing NOOP fillers) cost nothing
+    value = (
+        FITNESS_BASE
+        - CONFLICT_PENALTY * conflicts
+        - path_cost(initial_state, executed)
+        - HEURISTIC_WEIGHT * heuristic_column(state)
+    )
+    return max(FITNESS_FLOOR, value)
+
+
+def initialize_population(
+    initial_state: State,
+    size: int = 50,
+    rng: "random.Random | None" = None,
+    elitist_seeds: int = 2,
+) -> List[Tuple[Optional[Action], ...]]:
+    """Create generation 0: mostly random DNA plus elitist Greedy seeds.
+
+    - The population is predominantly independent random_chromosome() DNA
+      (default size 50).
+    - The first `elitist_seeds` members (default 2) are seeded from the Greedy
+      plan: seed 0 is the Greedy plan padded/truncated to the chromosome
+      length; seed 1 is a seeded shuffle of the Greedy plan, padded/truncated
+      the same way.  If the Greedy plan is unavailable (unsolvable board), the
+      seeds fall back to random DNA.
+    - initial_state is never mutated; rng defaults to random.Random().
+    """
+    if size < 1:
+        raise ValueError("population size must be at least 1")
+    rng = rng if rng is not None else random.Random()
+    length = max_len(initial_state)
+
+    population: List[Tuple[Optional[Action], ...]] = []
+    try:
+        greedy = list(solve_greedy(initial_state))
+    except ValueError:
+        greedy = None
+
+    def pad_truncate(plan: Sequence[Action]) -> Tuple[Optional[Action], ...]:
+        genes = list(plan[:length])
+        genes.extend([NOOP] * (length - len(genes)))
+        return tuple(genes)
+
+    seeds = max(0, min(elitist_seeds, size))
+    if greedy is not None:
+        population.append(pad_truncate(greedy))
+        if seeds >= 2:
+            shuffled = list(greedy)
+            rng.shuffle(shuffled)
+            population.append(pad_truncate(shuffled))
+    while len(population) < size:
+        population.append(random_chromosome(initial_state, rng))
+    return population[:size]
+
+
+def mutate(
+    dna: Sequence[Optional[Action]],
+    rng: random.Random,
+    rate: float = 0.08,
+) -> Tuple[Optional[Action], ...]:
+    """Mutate a DNA in place-free fashion: per-gene with probability `rate`.
+
+    For each gene chosen for mutation one of three operators is applied:
+
+    - replacement by a random legal, state-changing action for the state
+      reached by the genes BEFORE it (the prefix is re-simulated first, so
+      replacements are always sound);
+    - conversion to a NOOP filler (gene skipped, zero cost);
+    - an adjacent swap with the following gene (for the last gene this falls
+      back to a NOOP conversion).
+
+    The result has exactly the same length as the input, and the input DNA is
+    never modified.
+    """
+def mutate(
+    dna: Sequence[Optional[Action]],
+    rng: random.Random,
+    rate: float = 0.08,
+    initial_state: "State | None" = None,
+) -> Tuple[Optional[Action], ...]:
+    """Mutate a DNA per gene with probability `rate`; result keeps the length.
+
+    For each gene chosen for mutation one of three operators is applied:
+
+    - replacement by a random legal, state-changing action for the state
+      reached by the genes BEFORE it (the prefix is re-simulated from
+      initial_state, so replacements are position-sound);
+    - conversion to a NOOP filler (gene skipped, zero cost);
+    - an adjacent swap with the following gene (for the last gene this falls
+      back to a NOOP conversion).
+
+    initial_state may be omitted only for DNA whose genes are never replaced
+    (the re-simulation is skipped); the GA always passes it.  The input DNA
+    and initial_state are never modified, and a replacement that later turns
+    out illegal is simply a skipped conflict penalised by fitness.
+    """
+    if not 0.0 <= rate <= 1.0:
+        raise ValueError("mutation rate must be in [0, 1]")
+    genes = list(dna)
+    if not genes:
+        return tuple(genes)
+
+    needs_simulation = rng.random() < rate
+    if needs_simulation and initial_state is not None:
+        # Re-simulate gene by gene, mutating as we go, so every replacement
+        # is chosen against the state reached by the already-mutated prefix.
+        state = initial_state
+        for index in range(len(genes)):
+            if rng.random() >= rate:
+                # Unchanged gene: advance the simulation through it.
+                gene = genes[index]
+                if gene is not None:
+                    candidate = tuple(gene)
+                    if candidate in iter_actions(state):
+                        next_state = apply_action(state, *candidate)
+                        if unpack(next_state) != unpack(state):
+                            state = next_state
+                continue
+            kind = rng.random()
+            if kind < 0.5:
+                # Replace with a random legal, state-changing action.
+                options = [
+                    action
+                    for action in iter_actions(state)
+                    if unpack(apply_action(state, *action))
+                    != unpack(state)
+                ]
+                if options:
+                    genes[index] = rng.choice(options)
+                else:
+                    genes[index] = NOOP  # dead end: nothing legal to do
+            elif kind < 0.8 or index + 1 >= len(genes):
+                genes[index] = NOOP  # convert to filler
+            else:
+                # Adjacent swap with the following gene.
+                genes[index], genes[index + 1] = (
+                    genes[index + 1], genes[index]
+                )
+                break  # the swap moves the tail; stop re-simulating
+    else:
+        # No re-simulation needed (or no initial_state given): apply only
+        # filler conversions and adjacent swaps, which need no state.
+        for index in range(len(genes)):
+            if rng.random() < rate:
+                if rng.random() < 0.5 or index + 1 >= len(genes):
+                    genes[index] = NOOP
+                else:
+                    genes[index], genes[index + 1] = (
+                        genes[index + 1], genes[index]
+                    )
+    return tuple(genes)
+
+
+def crossover(
+    parent_a: Sequence[Optional[Action]],
+    parent_b: Sequence[Optional[Action]],
+    rng: random.Random,
+) -> Tuple[Tuple[Optional[Action], ...], Tuple[Optional[Action], ...]]:
+    """One-point crossover of two fixed-length DNAs.
+
+    Returns exactly two children of the same fixed chromosome length.  Cut
+    point is uniform in [1, len-1] so both children get a non-empty part of
+    each parent.  Children may contain conflicting genes - fitness penalises
+    those instead of rejecting the children.
+    """
+    length = min(len(parent_a), len(parent_b))
+    if length == 0:
+        return tuple(parent_a), tuple(parent_b)
+    cut = rng.randint(1, length - 1)
+    child_a = tuple(parent_a[:cut]) + tuple(parent_b[cut:length])
+    child_b = tuple(parent_b[:cut]) + tuple(parent_a[cut:length])
+    return child_a, child_b
+
+
+def select_parents(
+    population: Sequence[Tuple[Optional[Action], ...]],
+    fitnesses: Sequence[float],
+    mode: str = "deterministic",
+    rng: "random.Random | None" = None,
+    k: int = 2,
+) -> List[Tuple[Optional[Action], ...]]:
+    """Select k parent chromosomes from the population (no simulation here).
+
+    - mode "deterministic": rank the population by fitness (descending) and
+      return the k highest-ranked chromosomes (truncation selection).
+    - mode "stochastic": k tournaments of size 3; each tournament is biased
+      toward high fitness and needs no roulette-wheel normalisation.
+
+    Unsupported modes raise ValueError instead of silently defaulting.
+    """
+    if mode not in ("deterministic", "stochastic"):
+        raise ValueError(f"unsupported selection mode {mode!r}")
+    if not population:
+        return []
+    rng = rng if rng is not None else random.Random()
+    k = max(1, min(k, len(population)))
+    if mode == "deterministic":
+        ranked = sorted(
+            range(len(population)),
+            key=lambda i: fitnesses[i],
+            reverse=True,
+        )
+        return [population[i] for i in ranked[:k]]
+    parents = []
+    for _ in range(k):
+        contenders = rng.sample(range(len(population)), 3)
+        best = max(contenders, key=lambda i: fitnesses[i])
+        parents.append(population[best])
+    return parents
+
+
+def solve_genetic(
+    initial_state: State,
+    population_size: int = 50,
+    generations: int = 200,
+    mutation_rate: float = 0.08,
+    elite_count: int = 2,
+    selection: str = "deterministic",
+    seed: "int | None" = None,
+) -> List[Action]:
+    """Genetic Algorithm solver over fixed-length door-opening chromosomes.
+
+    Generation loop: evaluate fitness for the whole population, remember the
+    best valid complete plan, copy the `elite_count` best previous-generation
+    chromosomes unchanged (elitism), select parents, fill the new population
+    by one-point crossover, then mutate the children.  Stops when a complete
+    plan reaches the goal or the generation budget is exhausted.
+
+    The final plan is always re-validated with path_score().  If no complete
+    plan was found, the solver falls back to solve_greedy(), matching Local
+    Search's guarantee that a solution is returned whenever one exists.
+
+    Per-generation statistics (best/mean/worst fitness, best cost and conflict
+    count, generations used) are stored in the module-level GA_LAST_STATS dict
+    for the CLI to report.
+    """
+    if is_empty_state(initial_state):
+        GA_LAST_STATS.clear()
+        GA_LAST_STATS["generations_used"] = 0
+        GA_LAST_STATS["greedy_fallback"] = False
+        return []
+
+    rng = random.Random(seed)
+    length = max_len(initial_state)
+    population = initialize_population(
+        initial_state, size=population_size, rng=rng, elitist_seeds=elite_count
+    )
+
+    best_plan: "List[Action] | None" = None
+    best_cost: "int | None" = None
+    best_conflicts: "int | None" = None
+    generations_used = 0
+    per_generation: List[dict] = []
+
+    for generation in range(max(1, generations)):
+        generations_used = generation + 1
+        fitnesses = [fitness(initial_state, dna) for dna in population]
+
+        # Remember the best valid complete plan of this generation.
+        gen_best_cost = None
+        gen_best_conflicts = None
+        for dna in population:
+            actions, _state, reached_goal = decode_dna(initial_state, dna)
+            if reached_goal:
+                score = path_score(initial_state, actions)  # re-validate
+                cost = -score
+                if best_cost is None or cost < best_cost:
+                    best_plan, best_cost = list(actions), cost
+                    best_conflicts = len(dna) - len(actions)
+                if gen_best_cost is None or cost < gen_best_cost:
+                    gen_best_cost, gen_best_conflicts = cost, len(dna) - len(actions)
+        per_generation.append({
+            "generation": generation + 1,
+            "best": max(fitnesses),
+            "mean": sum(fitnesses) / len(fitnesses),
+            "worst": min(fitnesses),
+            "plan_cost": gen_best_cost,
+            "plan_conflicts": gen_best_conflicts,
+        })
+
+        if best_plan is not None:
+            break  # goal reached: stop early
+
+        # Elitism: copy the elite_count best previous-generation chromosomes.
+        ranked = sorted(range(len(population)), key=lambda i: fitnesses[i], reverse=True)
+        elites = [population[i] for i in ranked[:max(0, elite_count)]]
+
+        # Reproduce: crossover parents to fill, then mutate the children.
+        children: List[Tuple[Optional[Action], ...]] = list(elites)
+        while len(children) < population_size:
+            parents = select_parents(
+                population, fitnesses, mode=selection, rng=rng, k=2
+            )
+            child_a, child_b = crossover(parents[0], parents[1], rng)
+            children.append(mutate(child_a, rng, rate=mutation_rate, initial_state=initial_state))
+            if len(children) < population_size:
+                children.append(mutate(child_b, rng, rate=mutation_rate, initial_state=initial_state))
+        population = children[:population_size]
+
+    # Fallback: never return without a plan if Greedy can find one.
+    if best_plan is None:
+        try:
+            best_plan = list(solve_greedy(initial_state))
+            best_cost = path_cost(initial_state, best_plan)
+            fallback_used = True
+        except ValueError as error:
+            raise ValueError(f"Genetic found no solution: {error}") from error
+    else:
+        fallback_used = False
+
+    path_score(initial_state, best_plan)  # final safety validation
+    GA_LAST_STATS.clear()
+    GA_LAST_STATS.update({
+        "generations_used": generations_used,
+        "per_generation": per_generation,
+        "best_cost": best_cost,
+        "best_conflicts": best_conflicts,
+        "greedy_fallback": fallback_used,
+    })
+    return best_plan
+
+
+GA_LAST_STATS: dict = {}
+
+
+def dna_score(initial_state: State, dna: Sequence[Optional[Action]]) -> Optional[int]:
+    """Fitness of a DNA: the NEGATIVE weighted cost of its effective plan.
+
+    Returns None when the plan is incomplete (does not empty the board) -
+    e.g. a chromosome of all fillers scores as an incomplete plan, it does not
+    raise.  Complete plans score -path_cost, so higher (less negative) is
+    better, matching path_score's convention.
+    """
+    actions, _state, reached_goal = decode_dna(initial_state, dna)
+    if not reached_goal:
+        return None
+    return -path_cost(initial_state, actions)
 
 
 # ---------------------------------------------------------------------------
@@ -1441,7 +1969,7 @@ def run_gui(rows: int, cols: int, seed: Optional[int], algorithm: str = "BFS") -
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Solve the sand-door puzzle with DFS, BFS, IDS, UCS, Greedy, A*, "
-                    "or Local Search and visualize the plan."
+                    "Local Search, or Genetic and visualize the plan."
     )
     parser.add_argument("--cli", action="store_true", help="Run the command-line interface instead of the GUI.")
     parser.add_argument("--algo", choices=ALGORITHMS, default="BFS", help="Search algorithm to use (default: BFS).")
@@ -1456,6 +1984,13 @@ def parse_args() -> argparse.Namespace:
         help="Exhaustive analysis mode: enumerate initial states, compare Greedy "
              "against the optimum, and write histogram analysis_output/. "
              "Use with --rows/--cols and optionally --sample N. Requires matplotlib."
+    )
+    parser.add_argument("--ga-pop", type=int, default=50, help="Genetic: population size (default 50).")
+    parser.add_argument("--ga-generations", type=int, default=200, help="Genetic: generation budget (default 200).")
+    parser.add_argument("--ga-mutation", type=float, default=0.08, help="Genetic: per-gene mutation rate (default 0.08).")
+    parser.add_argument(
+        "--ga-selection", choices=("deterministic", "stochastic"), default="deterministic",
+        help="Genetic: parent selection mode (default: deterministic truncation)."
     )
     parser.add_argument(
         "--sample", type=int, default=None,
@@ -1545,7 +2080,17 @@ def main() -> None:
     globals()["successors"] = counting_successors
     try:
         started = time.perf_counter()
-        actions = solve(args.algo, initial_state)
+        if args.algo == "Genetic":
+            actions = solve_genetic(
+                initial_state,
+                population_size=max(2, args.ga_pop),
+                generations=max(1, args.ga_generations),
+                mutation_rate=min(max(args.ga_mutation, 0.0), 1.0),
+                selection=args.ga_selection,
+                seed=args.seed,
+            )
+        else:
+            actions = solve(args.algo, initial_state)
         elapsed = time.perf_counter() - started
     finally:
         globals()["successors"] = original_successors
@@ -1561,6 +2106,25 @@ def main() -> None:
     print(f"Node expansions    : {expansion_counter['nodes']}")
     ebf = effective_branching_factor(expansion_counter["nodes"], len(actions))
     print(f"Effective b-factor : " + (f"{ebf:.3f}" if ebf is not None else "n/a"))
+    if args.algo == "Genetic":
+        stats = GA_LAST_STATS
+        history = stats.get("per_generation", [])
+        print(f"Generations used   : {stats.get('generations_used', '?')}")
+        if history:
+            print("Per-generation fitness (gen, best, mean, worst):")
+            for entry in history:
+                print(
+                    f"  gen {entry['generation']:>3}: "
+                    f"best={entry['best']:.1f} mean={entry['mean']:.1f} "
+                    f"worst={entry['worst']:.1f} "
+                    f"plan_cost={entry['plan_cost']} "
+                    f"conflicts={entry['plan_conflicts']}"
+                )
+        print(f"Best plan cost     : {stats.get('best_cost', '?')}")
+        print(
+            "Greedy fallback    : "
+            + ("used" if stats.get('greedy_fallback') else "not used")
+        )
     if actions:
         print("Actions:")
         for index, action in enumerate(actions, start=1):

@@ -15,7 +15,7 @@ The puzzle combines pathfinding, state-space search, and physics-like flow rules
 
 ## Features
 
-- 8 solving algorithms
+- 9 solving algorithms
   - DFS
   - BFS
   - IDS
@@ -24,6 +24,7 @@ The puzzle combines pathfinding, state-space search, and physics-like flow rules
   - A* with the structural heuristic
   - Local Search (hill climbing seeded from the Greedy plan)
   - Greedy scan strategy
+  - Genetic Algorithm (fixed-length door-opening chromosomes, elitist)
 - Effective branching-factor estimation for every search run
 - Random board generation with reproducible seeds
 - Fixed special-case board for validation
@@ -37,6 +38,7 @@ The puzzle combines pathfinding, state-space search, and physics-like flow rules
 - `analysis.py` - exhaustive board analysis and plot generation
 - `HEURISTIC.md` - definitions and admissibility/consistency proofs for the A* heuristics
 - `test_local_search.py` - unit tests (environment edge cases, plan scoring, Local Search)
+- `test_genetic.py` - GA unit tests (chromosome API, fitness, selection, mutation/crossover, GA loop, fallback)
 - `test_anim_smoke.py` - script-style smoke test (UCS vs. A* cost agreement, joins)
 - `analysis_output/` - generated CSV and PNG analysis results
 
@@ -246,6 +248,45 @@ The project implements the weighted cost model from the puzzle specification:
 - A* (column): stronger structural heuristic, cost-optimal
 - Greedy: deterministic scan strategy, not globally optimal
 - Local Search: hill climbing from Greedy; never worse than Greedy, not optimal
+- Genetic: population search over fixed-length chromosomes with elitism;
+  never worse than Greedy (Greedy fallback), not optimal
+
+### Genetic Algorithm
+
+`solve_genetic(initial_state, population_size=50, generations=200,
+mutation_rate=0.08, elite_count=2, selection="deterministic", seed=None)`.
+
+- Chromosome: fixed-length DNA of `MAX_LEN = 2 * rows * cols` genes, each a
+  `(row, col, direction)` door opening or the `NOOP` filler.
+- Fitness: `1e6 - 1000 * skipped-genes-before-goal - path cost - 50 *
+  heuristic_column(final state)`; always positive and finite.
+- Generation 0 is mostly `random_chromosome()` DNA, with 2 elitist seeds from
+  the Greedy plan (the plan itself and a seeded shuffle).
+- Elitism copies the best `elite_count` (default 2) previous-generation
+  chromosomes unchanged; parents are chosen by `select_parents` in either
+  `deterministic` (truncation) or `stochastic` (size-3 tournament) mode.
+- Reproduction is one-point crossover followed by per-gene mutation
+  (rate 0.08 by default: replace with a legal action, convert to a filler,
+  or swap adjacent genes).
+- The loop stops as soon as a chromosome encodes a complete plan, which is
+  always re-validated with `path_score()`; otherwise the Greedy plan is
+  returned as a fallback (Local Search's guarantee).
+- Per-generation statistics (best/mean/worst fitness, best plan cost and
+  conflict count, generations used, fallback status) are printed by the CLI.
+
+CLI flags for Genetic:
+
+```powershell
+python problem.py --cli --special-case --algo Genetic --ga-pop 50 `
+  --ga-generations 200 --ga-mutation 0.08 --ga-selection deterministic
+```
+
+`--ga-selection` also accepts `stochastic` (tournament). On the special-case
+board the GA returns the Greedy-plan quality (cost 48) because the elitist
+Greedy seed is already a complete plan that stops generation 0; the
+`stochastic` mode explores more but does not beat cost 47 (Local Search's
+result) within the default budget, so `deterministic` is the measured,
+better-performing default.
 
 ## Effective branching factor
 
@@ -337,12 +378,15 @@ This name is descriptive, clear, and works well on GitHub.
 
 ## Benchmark script (`evaluate_boards.py`)
 
-Evaluates UCS, A* (sand), A* (column), Greedy and Local Search on the
+Evaluates UCS, A* (sand), A* (column), Greedy, Local Search and Genetic on the
 fixed special-case board and three seeded random boards, recording cost,
 actions, type-A/type-B counts, expanded nodes, time, depth and the
 effective branching factor. Writes `analysis_output/benchmark_results.csv`
 and prints a summary table. All seeds are fixed and documented in the
-script's docstring, so results are exactly reproducible.
+script's docstring, so results are exactly reproducible. Genetic runs with
+population 50, 200 generations, mutation rate 0.08, deterministic selection
+and seed 7; its `expanded_nodes` stays 0 because fitness evaluations are not
+state expansions.
 
 Example output (special-case board, 4x2):
 
@@ -353,6 +397,7 @@ special     A* (sand)         34   10   7   3   3611    10  2.129  0.1402
 special     A* (column)       34   10   7   3   3484    10  2.121  0.1358
 special     Greedy            48    8   8   0      0     8    n/a  0.0001
 special     Local Search      47    7   7   0      0     7    n/a  0.0123
+special     Genetic           48    8   8   0      0     8    n/a  0.0265
 ```
 
 ## Generated plots and CSV files
